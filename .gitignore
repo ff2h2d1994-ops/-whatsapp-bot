@@ -1,0 +1,209 @@
+const express = require('express');
+const axios = require('axios');
+const { google } = require('googleapis');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const SHEET_NAME = 'Sheet1';
+
+// Temporary in-memory state storage for demo/testing.
+// Production should use a database such as Supabase or PostgreSQL.
+const userStates = new Map();
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+async function sendWhatsAppMessage(to, text) {
+  const token = process.env.WHATSAPP_TOKEN;
+  const phoneNumberId = process.env.PHONE_NUMBER_ID;
+  const graphApiVersion = process.env.GRAPH_API_VERSION || 'v20.0';
+
+  if (!token || !phoneNumberId) {
+    throw new Error('Missing WHATSAPP_TOKEN or PHONE_NUMBER_ID in environment variables.');
+  }
+
+  const url = `https://graph.facebook.com/${graphApiVersion}/${phoneNumberId}/messages`;
+
+  await axios({
+    method: 'POST',
+    url,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    data: {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to,
+      type: 'text',
+      text: {
+        body: text,
+      },
+    },
+  });
+}
+
+function getGoogleSheetsClient() {
+  const serviceAccountEmail = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+  const privateKey = process.env.GOOGLE_PRIVATE_KEY
+    ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n')
+    : null;
+
+  if (!serviceAccountEmail || !privateKey) {
+    throw new Error('Missing Google service account configuration.');
+  }
+
+  const auth = new google.auth.GoogleAuth({
+    credentials: {
+      client_email: serviceAccountEmail,
+      private_key: privateKey,
+    },
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  });
+
+  return google.sheets({ version: 'v4', auth });
+}
+
+async function appendLeadToSheet(lead) {
+  const sheetId = process.env.GOOGLE_SHEET_ID;
+
+  if (!sheetId) {
+    throw new Error('Missing GOOGLE_SHEET_ID in environment variables.');
+  }
+
+  const sheets = getGoogleSheetsClient();
+  const now = new Date();
+  const dateText = now.toISOString();
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: sheetId,
+    range: `${SHEET_NAME}!A:F`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: {
+      values: [[lead.name, lead.phone, lead.service, lead.budget, lead.city, dateText]],
+    },
+  });
+}
+
+async function processIncomingMessage(message) {
+  if (!message || message.type !== 'text') {
+    const from = message && message.from ? message.from : null;
+
+    if (from) {
+      await sendWhatsAppMessage(from, 'حالياً أستطيع استقبال الرسائل النصية فقط.');
+    }
+    return;
+  }
+
+  const from = message.from;
+  const rawText = (message.text && message.text.body ? message.text.body : '').trim();
+
+  if (!rawText) {
+    return;
+  }
+
+  try {
+    let state = userStates.get(from);
+
+    if (!state) {
+      await sendWhatsAppMessage(from, 'أهلاً وسهلاً 👋\nيسعدنا خدمتك.\nما اسمك؟');
+      userStates.set(from, { step: 'awaiting_name', data: {} });
+      return;
+    }
+
+    if (state.step === 'awaiting_name') {
+      state.data.name = rawText;
+      state.step = 'awaiting_service';
+      userStates.set(from, state);
+      await sendWhatsAppMessage(from, 'ما الخدمة التي تحتاجها؟');
+      return;
+    }
+
+    if (state.step === 'awaiting_service') {
+      state.data.service = rawText;
+      state.step = 'awaiting_budget';
+      userStates.set(from, state);
+      await sendWhatsAppMessage(from, 'كم ميزانيتك التقريبية؟');
+      return;
+    }
+
+    if (state.step === 'awaiting_budget') {
+      state.data.budget = rawText;
+      state.step = 'awaiting_city';
+      userStates.set(from, state);
+      await sendWhatsAppMessage(from, 'في أي مدينة أنت؟');
+      return;
+    }
+
+    if (state.step === 'awaiting_city') {
+      state.data.city = rawText;
+      state.data.phone = from;
+
+      await appendLeadToSheet(state.data);
+
+      const finalMessage = `شكراً ${state.data.name} ✅\n\nتم تسجيل طلبك بنجاح.\n\nالخدمة:\n${state.data.service}\n\nالميزانية:\n${state.data.budget}\n\nالمدينة:\n${state.data.city}\n\nسيتواصل معك فريقنا قريباً.`;
+
+      await sendWhatsAppMessage(from, finalMessage);
+      userStates.delete(from);
+      return;
+    }
+
+    userStates.delete(from);
+    await sendWhatsAppMessage(from, 'أهلاً وسهلاً 👋\nيسعدنا خدمتك.\nما اسمك؟');
+    userStates.set(from, { step: 'awaiting_name', data: {} });
+  } catch (error) {
+    console.error(`Error processing message from ${from}:`, error.message);
+    try {
+      await sendWhatsAppMessage(from, 'حدث خطأ مؤقت. يرجى المحاولة مرة أخرى لاحقاً.');
+    } catch (sendError) {
+      console.error('Failed to send error message:', sendError.message);
+    }
+  }
+}
+
+app.get('/', (req, res) => {
+  res.status(200).send('WhatsApp Leads Bot is running ✅');
+});
+
+app.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode === 'subscribe' && token === process.env.VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
+  }
+
+  return res.status(403).send('Forbidden');
+});
+
+app.post('/webhook', async (req, res) => {
+  try {
+    const payload = req.body || {};
+    const entries = payload.entry || [];
+
+    for (const entry of entries) {
+      const changes = entry.changes || [];
+
+      for (const change of changes) {
+        const value = change.value || {};
+        const messages = value.messages || [];
+
+        for (const message of messages) {
+          await processIncomingMessage(message);
+        }
+      }
+    }
+
+    return res.status(200).send('OK');
+  } catch (error) {
+    console.error('Webhook error:', error.message);
+    return res.status(200).send('OK');
+  }
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on http://0.0.0.0:${PORT}`);
+});
+
+module.exports = app;

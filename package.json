@@ -1,11 +1,14 @@
 {
-  "name": "whatsapp-bot",
+  "name": "whatsapp-leads-bot",
   "version": "1.0.0",
+  "description": "WhatsApp Leads Generation Bot using WhatsApp Cloud API, Express, and Google Sheets",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^5.1.0"
+    "axios": "^1.7.7",
+    "express": "^4.21.2",
+    "googleapis": "^144.0.0"
   }
 }
